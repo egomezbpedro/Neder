@@ -1,0 +1,332 @@
+#+title: neder.el
+#+subtitle: The 99 agentic workflow, ported to Emacs
+#+options: toc:2 num:nil
+
+An Emacs port of [[https://github.com/ThePrimeagen/99][ThePrimeagen's 99]]. It augments hand-written code rather
+than replacing it: you select a region, say what you want, and the
+answer comes back into that exact region under your review.
+
+Neder is not an HTTP client. It spawns an agentic coding CLI (=claude=,
+=opencode=, ...) as a subprocess, hands it a prompt assembled from your
+selection plus project context, and applies the result back to the
+buffer that asked for it.
+
+* Why this and not a chat buffer
+
+Three different jobs, three different tools. Neder only does the middle one.
+
+| Job                                         | Tool              |
+|---------------------------------------------+-------------------|
+| Long agentic session, multi-file, repo-wide | =claude-code-ide= |
+| Surgical in-buffer op on a region           | *Neder*           |
+| Open-ended chat                             | =gptel=           |
+
+* Key features
+
+- *Region in, region out.* The answer replaces the selection you made,
+  in the buffer you made it in, even if the buffer shifted meanwhile.
+- *Review before anything is written.* The default apply style shows a
+  unified diff and asks. Nothing reaches a source file unseen.
+- *Mid-request edit detection.* If you edit the region while the model
+  is thinking, you are asked before its answer discards your edit.
+- *Structured responses.* Providers parse a JSON envelope, so the
+  answer is a named field rather than prose to be guessed at. Cost and
+  turn count come back with it.
+- *Scoped context.* Sends the enclosing function via tree-sitter, not a
+  fixed line window, so the model never receives a form cut in half.
+  Flymake diagnostics ride along.
+- *Skills and file references.* Write =#skill= or =@path= in a prompt and
+  the content is injected, with completion for both.
+- *Three ops, and a registry for your own.* =visual=, =ask=, =search=, plus
+  =neder-run= for ops you define in your config.
+- *Cancellable.* Every request can be stopped; a CLI that ignores
+  SIGTERM gets SIGKILL.
+
+* How it works
+
+#+begin_example
+  region + prompt
+        |
+        v
+  prompt assembly ... operation text
+                      user prompt
+                      diagnostics
+                      #skills and @files
+                      CLAUDE.md / AGENTS.md walked up to project root
+                      output contract
+        |
+        v
+  provider CLI as a subprocess (no shell, argv list)
+        |
+        v
+  response parsed from the JSON envelope
+        |
+        v
+  markers locate the original region --> diff --> you approve --> buffer
+#+end_example
+
+Two details matter.
+
+*Markers, not line numbers.* The region is tracked with Emacs markers
+carrying their own buffer. Edits elsewhere in the file shift them
+correctly, and the answer cannot land in whatever buffer you happened
+to switch to. If the region was deleted outright, the request fails
+instead of guessing.
+
+*Two transports.* By default the CLI is told to answer on stdout and
+touch nothing. Set =neder-unsafe-skip-permissions= and it is instead told
+to write to a temp file, matching upstream — that passes
+=--dangerously-skip-permissions= to =claude=, which lets it modify files
+and run commands with no confirmation. The default is the safe one.
+
+* Install
+
+Requires Emacs 30.2 and a provider CLI on =PATH=.
+
+** Doom Emacs
+
+The package is developed in place, so =straight= does not manage it.
+
+#+begin_src emacs-lisp
+  ;; config.el
+  (add-load-path! "~/projects/Neder")
+
+  (use-package! neder
+    :defer t
+    :commands (neder-visual neder-ask neder-search neder-run neder-open
+               neder-stop-all-requests neder-info)
+    :init
+    (map! :leader
+          (:prefix-map ("n" . "Neder")
+           :desc "Visual selection prompt" :v  "v" #'neder-visual
+           :desc "Ask about selection"     :v  "a" #'neder-ask
+           :desc "Semantic search"         :nv "s" #'neder-search
+           :desc "Reopen a past result"    :nv "o" #'neder-open
+           :desc "Stop all requests"       :nv "k" #'neder-stop-all-requests
+           :desc "Info"                    :nv "i" #'neder-info))
+    :config
+    (setq neder-provider 'claude
+          neder-context-file-names '("CLAUDE.md" "AGENTS.md")
+          neder-visual-apply-style 'confirm
+          neder-context-strategy 'defun))
+#+end_src
+
+A GUI or daemon Emacs started from the desktop does not inherit the
+login shell's =PATH=, so the CLI will not be found. Either fix
+=exec-path= or point at it directly:
+
+#+begin_src emacs-lisp
+  (setq neder-executable-overrides '((claude . "~/.local/bin/claude")))
+#+end_src
+
+* Usage
+
+** neder-visual — replace the selection
+
+Select a region, run =neder-visual=, describe the change. The model's
+answer replaces the selection.
+
+Works well on a region that is a note to yourself:
+
+#+begin_src python
+  def parse_config(path):
+      # TODO read the file, parse it as TOML, raise ConfigError on bad input
+      pass
+#+end_src
+
+Select the body, prompt =implement this=, review the diff, accept.
+
+** neder-ask — question without modification
+
+Same selection, but the answer renders as Org in =*neder-answer*= and the
+source buffer is never touched. For "what does this do", "why is this
+slow", "what breaks if I change this".
+
+** neder-search — agentic project search
+
+No region needed. Describe what you are looking for; results land in a
+=grep-mode= buffer, so =n= / =p= / RET navigate them like any grep.
+
+#+begin_quote
+Unlike grep, this reads and reasons about the code, so "where do we
+retry failed uploads" works even when nothing contains the word retry.
+#+end_quote
+
+** The prompt buffer
+
+Prompts open in a small =neder-prompt-mode= buffer.
+
+| Key       | Action                  |
+|-----------+-------------------------|
+| =C-c C-c= | Send                    |
+| =C-c C-k= | Abort                   |
+| =#=       | Complete a skill name   |
+| =@=       | Complete a project file |
+
+Set =neder-use-prompt-buffer= to =nil= for a plain minibuffer prompt.
+
+*** Skills
+
+A skill is a directory holding a =SKILL.md=. Referencing =#tdd= in a
+prompt injects that file's content into the request.
+
+#+begin_example
+  .agents/skills/tdd/SKILL.md
+  .claude/skills/pr/SKILL.md
+  ~/.claude/skills/review/SKILL.md
+#+end_example
+
+Searched in =neder-skill-directories= order, so a project-local skill
+shadows a global one of the same name.
+
+*** File references
+
+=@src/auth.py= injects that file. Paths resolve from the project root and
+complete from =git ls-files=, so =.gitignore= is respected. Files over
+=neder-max-reference-file-bytes= (100 KiB) are skipped.
+
+** Other commands
+
+| Command                   | Does                                         |
+|---------------------------+----------------------------------------------|
+| =neder-open=              | Reopen a past result                         |
+| =neder-stop-request=      | Cancel the most recent in-flight request     |
+| =neder-stop-all-requests= | Cancel everything                            |
+| =neder-info=              | In-flight and completed counts, session cost |
+
+* Reviewing the answer
+
+=neder-visual-apply-style= decides what happens when the answer arrives.
+
+| Value     | Behaviour                                                   |
+|-----------+-------------------------------------------------------------|
+| =confirm= | Unified diff, then yes/no. The default.                     |
+| =direct=  | Replace immediately.                                        |
+| =ediff=   | Ediff session; the proposed buffer is applied when it ends. |
+
+Every replacement is a single =undo= step regardless of style.
+
+If the region changed while the request was running, you are asked
+before the answer is applied — the answer was computed from the old
+text, so applying it silently would discard your edit.
+
+* Defining your own op
+
+Ops live in a registry, so a new workflow is config rather than a patch.
+=neder-run= drives any registered op:
+
+#+begin_src emacs-lisp
+  (defun my/neder-diagnose-tests ()
+    "Run the test suite and locate every failure."
+    (interactive)
+    (neder-run :op 'search
+              :prompt "run the project's test suite, then report the location
+  of every failure with a note explaining the cause"))
+#+end_src
+
+Registering a genuinely new op takes two functions — one that builds
+the operation text, one that handles the response:
+
+#+begin_src emacs-lisp
+  (neder-register-op
+   (neder-op-create
+    :name 'explain
+    :region-p t          ; reads the active region
+    :track-p nil         ; does not write back, so no markers
+    :op-prompt (lambda (req)
+                 (format "Explain this code to a new teammate.\n%s"
+                         (neder-request-selection req)))
+    :complete (lambda (req response)
+                (with-current-buffer (get-buffer-create "*explain*")
+                  (erase-buffer)
+                  (insert response)
+                  (pop-to-buffer (current-buffer))))))
+#+end_src
+
+Set =:track-p= only when the op writes its answer back to the region;
+that is what decides whether markers are taken and whether the overlap
+guard applies.
+
+* Providers
+
+| Provider   | CLI        | Default model                |
+|------------+------------+------------------------------|
+| =claude=   | =claude=   | =claude-sonnet-5-5=          |
+| =opencode= | =opencode= | =opencode/claude-sonnet-4-5= |
+
+Switch with =neder-provider=; override the model with =neder-model=. Adding
+one is a =build-command= and a default model:
+
+#+begin_src emacs-lisp
+  (neder-register-provider
+   (neder-provider-create
+    :name 'cursor-agent
+    :display-name "CursorAgentProvider"
+    :executable "cursor-agent"
+    :default-model "sonnet-4.5"
+    :build-command
+    (lambda (model prompt unsafe)
+      (append '("cursor-agent")
+              (when unsafe '("--trust" "--force"))
+              (list "--model" model "--print" prompt)))))
+#+end_src
+
+The prompt is always the last positional argument.
+
+Give a provider a =parse-response= when its CLI can emit structured
+output. It receives stdout and returns a plist with =:text= and
+optionally =:cost=, =:session-id=, =:turns= and =:error=. This is what keeps
+a chatty preamble out of your source files.
+
+* Configuration reference
+
+| Variable                             | Default        | Meaning                                  |
+|--------------------------------------+----------------+------------------------------------------|
+| =neder-provider=                     | ='claude=      | Which CLI to drive                       |
+| =neder-model=                        | =nil=          | Override the provider's default model    |
+| =neder-executable-overrides=         | =nil=          | Absolute path per provider               |
+| =neder-visual-apply-style=           | ='confirm=     | How answers reach the buffer             |
+| =neder-confirm-on-changed-selection= | =t=            | Ask if the region changed mid-request    |
+| =neder-context-strategy=             | ='defun=       | Enclosing form, or a line window         |
+| =neder-surrounding-context-lines=    | =100=          | Window size when strategy is ='lines=    |
+| =neder-context-file-names=           | =nil=          | e.g. ="CLAUDE.md"=, walked to the root   |
+| =neder-skill-directories=            | three defaults | Where =#skill= looks                     |
+| =neder-reference-files=              | =t=            | Resolve =@path= references               |
+| =neder-include-diagnostics=          | =t=            | Send Flymake diagnostics                 |
+| =neder-include-hover=                | =nil=          | Send LSP hover text (synchronous)        |
+| =neder-use-prompt-buffer=            | =t=            | Prompt buffer instead of the minibuffer  |
+| =neder-spinner=                      | =t=            | In-buffer progress indicator             |
+| =neder-request-timeout=              | =300=          | Seconds before a request is cancelled    |
+| =neder-max-concurrent-requests=      | =3=            | In-flight cap                            |
+| =neder-unsafe-skip-permissions=      | =nil=          | Let the CLI write files and run commands |
+| =neder-debug=                        | =nil=          | Log to =*neder-log*=, mirror prompts     |
+
+* Tests
+
+#+begin_src sh
+  emacs -Q --batch -L . -l neder-tests.el -f ert-run-tests-batch-and-exit
+#+end_src
+
+The suite uses a stub provider whose argv is a shell command, so no
+model is ever called and the tests cost nothing.
+
+* Differences from upstream
+
+Deliberate divergences, all of them Emacs-shaped:
+
+- Markers instead of extmarks, and an assert that the answer lands in
+  the buffer that made the request.
+- =atomic-change-group= so a replacement is one undo step and cannot be
+  half-applied.
+- Diff review before the buffer is touched. Upstream writes directly.
+- JSON response parsing, so safe mode does not depend on the model
+  declining to write a preamble.
+- A request timeout, a concurrency cap, an overlap guard and SIGKILL
+  escalation. Upstream has none of these.
+- =neder-ask=, which upstream has no equivalent of.
+- Not ported: =vibe=, =tutorial=, the Worker extension, the model and
+  provider pickers.
+
+* License
+
+MIT License. See [[file:LICENSE][LICENSE]] for details.
