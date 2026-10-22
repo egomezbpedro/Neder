@@ -2,7 +2,7 @@
 #+subtitle: The 99 agentic workflow, ported to Emacs
 #+options: toc:2 num:nil
 
-An Emacs port of [[https://github.com/ThePrimeagen/99][ThePrimeagen's 99]]. It augments hand-written code rather
+An Emacs "vivecoded" port of [[https://github.com/ThePrimeagen/99][ThePrimeagen's 99]]. It augments hand-written code rather
 than replacing it: you select a region, say what you want, and the
 answer comes back into that exact region under your review.
 
